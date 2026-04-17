@@ -1,0 +1,141 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: python-devops-app-alerts
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  groups:
+    # ── Application RED Metrics (Rate / Errors / Duration) ──
+    - name: app.red.rules
+      interval: 30s
+      rules:
+        - alert: HighErrorRate
+          expr: |
+            (
+              rate(http_requests_total{namespace="production", status=~"5.."}[5m])
+              /
+              rate(http_requests_total{namespace="production"}[5m])
+            ) > 0.05
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "High error rate: {{ $labels.service }}"
+            description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%) for service {{ $labels.service }} in namespace {{ $labels.namespace }}"
+            runbook_url: "https://runbooks.internal/high-error-rate"
+            dashboard_url: "https://grafana.yourdomain.com/d/red-dashboard"
+
+        - alert: HighLatencyP99
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{namespace="production"}[5m]))
+              by (le, service)
+            ) > 2
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "High p99 latency: {{ $labels.service }}"
+            description: "p99 latency is {{ $value | humanizeDuration }} (threshold: 2s) for {{ $labels.service }}"
+
+        - alert: LowRequestRate
+          expr: |
+            rate(http_requests_total{namespace="production"}[5m]) < 1
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "Low request rate — possible traffic loss"
+            description: "Request rate dropped below 1 req/s for service {{ $labels.service }}"
+
+    # ── Kubernetes Pod Health ──
+    - name: k8s.pod.rules
+      rules:
+        - alert: PodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{namespace="production"}[15m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pod crash looping: {{ $labels.pod }}"
+            description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} is crash looping"
+
+        - alert: PodNotReady
+          expr: |
+            kube_pod_status_ready{namespace="production", condition="true"} == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod not ready: {{ $labels.pod }}"
+            description: "Pod {{ $labels.pod }} has been not-ready for 5 minutes"
+
+        - alert: DeploymentReplicasMismatch
+          expr: |
+            kube_deployment_spec_replicas{namespace="production"}
+            != kube_deployment_status_available_replicas{namespace="production"}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Replica count mismatch: {{ $labels.deployment }}"
+            description: "Deployment {{ $labels.deployment }} has {{ $value }} fewer available replicas than desired"
+
+    # ── Node Health ──
+    - name: k8s.node.rules
+      rules:
+        - alert: NodeMemoryPressure
+          expr: |
+            (
+              node_memory_MemAvailable_bytes
+              / node_memory_MemTotal_bytes
+            ) < 0.10
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Node memory critical: {{ $labels.node }}"
+            description: "Node {{ $labels.node }} has only {{ $value | humanizePercentage }} memory available"
+
+        - alert: NodeDiskPressure
+          expr: |
+            (
+              node_filesystem_avail_bytes{mountpoint="/"}
+              / node_filesystem_size_bytes{mountpoint="/"}
+            ) < 0.15
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Low disk space: {{ $labels.node }}"
+            description: "Node {{ $labels.node }} root filesystem is {{ $value | humanizePercentage }} full"
+
+        - alert: NodeCPUHigh
+          expr: |
+            100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 85
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High CPU: {{ $labels.instance }}"
+            description: "Node {{ $labels.instance }} CPU usage is {{ $value }}% (threshold: 85%)"
+
+    # ── HPA Scaling Events ──
+    - name: k8s.hpa.rules
+      rules:
+        - alert: HPAMaxReplicasReached
+          expr: |
+            kube_horizontalpodautoscaler_status_current_replicas
+            == kube_horizontalpodautoscaler_spec_max_replicas
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "HPA at max replicas: {{ $labels.horizontalpodautoscaler }}"
+            description: "HPA {{ $labels.horizontalpodautoscaler }} has reached maximum replicas ({{ $value }}). Consider increasing maxReplicas."

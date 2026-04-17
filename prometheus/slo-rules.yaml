@@ -1,0 +1,92 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: slo-burn-rate-alerts
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  groups:
+    # ── SLO: 99.9% availability over 30 days ──
+    # Error budget = 0.1% of 30 days = 43.2 minutes
+    - name: slo.availability.rules
+      rules:
+        # Recording rules for burn rate calculation
+        - record: job:http_errors:rate5m
+          expr: rate(http_requests_total{namespace="production", status=~"5.."}[5m])
+
+        - record: job:http_requests:rate5m
+          expr: rate(http_requests_total{namespace="production"}[5m])
+
+        - record: job:error_ratio:rate5m
+          expr: job:http_errors:rate5m / job:http_requests:rate5m
+
+        # Fast burn: 14.4x burn rate over 1h = depletes budget in 2 days
+        # Page immediately
+        - alert: SLOErrorBudgetBurnFast
+          expr: |
+            (
+              job:error_ratio:rate5m > (14.4 * 0.001)
+            )
+          for: 2m
+          labels:
+            severity: critical
+            slo: availability
+            window: "1h"
+          annotations:
+            summary: "SLO: Error budget burning at 14.4× rate"
+            description: "Service is consuming error budget at 14.4× the sustainable rate. Budget exhausted in < 2 days if unresolved."
+            runbook_url: "https://runbooks.internal/slo-burn-fast"
+
+        # Medium burn: 6x burn rate over 6h = depletes budget in 5 days
+        # Page during business hours
+        - alert: SLOErrorBudgetBurnMedium
+          expr: |
+            (
+              rate(http_requests_total{namespace="production", status=~"5.."}[6h])
+              /
+              rate(http_requests_total{namespace="production"}[6h])
+            ) > (6 * 0.001)
+          for: 15m
+          labels:
+            severity: warning
+            slo: availability
+            window: "6h"
+          annotations:
+            summary: "SLO: Error budget burning at 6× rate"
+            description: "Service is consuming error budget at 6× the sustainable rate. Budget exhausted in < 5 days."
+
+        # Slow burn: 3x burn rate over 3 days = depletes budget in 10 days
+        # Alert but no page
+        - alert: SLOErrorBudgetBurnSlow
+          expr: |
+            (
+              rate(http_requests_total{namespace="production", status=~"5.."}[3d])
+              /
+              rate(http_requests_total{namespace="production"}[3d])
+            ) > (3 * 0.001)
+          for: 1h
+          labels:
+            severity: info
+            slo: availability
+            window: "3d"
+          annotations:
+            summary: "SLO: Slow error budget drain"
+            description: "Service has been burning error budget at 3× rate for 3 days. Investigate steady-state errors."
+
+    # ── SLO: p99 latency < 500ms over 30 days ──
+    - name: slo.latency.rules
+      rules:
+        - alert: SLOLatencyBudgetBurn
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket{namespace="production"}[1h]))
+              by (le)
+            ) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            slo: latency
+          annotations:
+            summary: "SLO: p99 latency exceeds 500ms"
+            description: "p99 latency is {{ $value | humanizeDuration }} which exceeds the 500ms SLO target"
