@@ -1,0 +1,150 @@
+name: Validate Observability Stack
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: YAML Lint
+  # ─────────────────────────────────────────────
+  yaml-lint:
+    name: YAML Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install yamllint
+        run: pip install yamllint
+
+      - name: Lint all YAML files
+        run: |
+          yamllint -d "{extends: relaxed, rules: {line-length: {max: 150}}}" \
+            $(find . -name "*.yaml" -o -name "*.yml" | grep -v ".github")
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Helm Template Validation
+  # ─────────────────────────────────────────────
+  helm-lint:
+    name: Helm Lint — Values Files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Add Helm repos
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+
+      - name: Validate Prometheus stack values
+        run: |
+          helm template monitoring prometheus-community/kube-prometheus-stack \
+            --values prometheus/prometheus-values.yaml \
+            --namespace monitoring \
+            --dry-run > /dev/null
+          echo "Prometheus values: OK"
+
+      - name: Validate Loki stack values
+        run: |
+          helm template loki grafana/loki-stack \
+            --values loki/loki-values.yaml \
+            --namespace monitoring \
+            --dry-run > /dev/null
+          echo "Loki values: OK"
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Kubeval — Manifest Schema Validation
+  # ─────────────────────────────────────────────
+  kubeval:
+    name: Kubeval — Schema Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kubeval
+        run: |
+          curl -sL https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz | tar xz
+          sudo mv kubeval /usr/local/bin/
+
+      - name: Validate OTel Collector manifest
+        run: |
+          kubeval --strict --ignore-missing-schemas otel/otel-collector.yaml
+          echo "OTel Collector manifest: OK"
+
+      - name: Validate Grafana ConfigMap
+        run: |
+          kubeval --strict --ignore-missing-schemas grafana/grafana-configmap.yaml
+          echo "Grafana ConfigMap: OK"
+
+  # ─────────────────────────────────────────────
+  # JOB 4: Checkov IaC Security Scan
+  # ─────────────────────────────────────────────
+  checkov:
+    name: Checkov — IaC Security Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Checkov on manifests
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: kubernetes
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov.sarif
+        continue-on-error: true
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov.sarif
+        if: always()
+        continue-on-error: true
+
+  # ─────────────────────────────────────────────
+  # JOB 5: PrometheusRule Validation
+  # ─────────────────────────────────────────────
+  promtool:
+    name: Promtool — Alert Rule Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Prometheus (promtool)
+        run: |
+          PROM_VERSION=2.49.1
+          curl -sL https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz | tar xz
+          sudo mv prometheus-${PROM_VERSION}.linux-amd64/promtool /usr/local/bin/
+
+      - name: Extract and validate alert rules
+        run: |
+          # Extract just the 'groups' section from PrometheusRule CRDs for promtool
+          python3 - <<'EOF'
+          import yaml, sys
+
+          for filepath in ['prometheus/alert-rules.yaml', 'prometheus/slo-rules.yaml']:
+              with open(filepath) as f:
+                  doc = yaml.safe_load(f)
+              groups = doc.get('spec', {}).get('groups', [])
+              out = {'groups': groups}
+              outfile = filepath.replace('.yaml', '-extracted.yaml')
+              with open(outfile, 'w') as f:
+                  yaml.dump(out, f)
+              print(f"Extracted: {outfile}")
+          EOF
+
+          promtool check rules prometheus/alert-rules-extracted.yaml
+          promtool check rules prometheus/slo-rules-extracted.yaml
+          echo "All alert rules valid"
